@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Pulseboard">
+  <defs>
+    <linearGradient id="p" x1="8" y1="8" x2="56" y2="56" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#7BF4D4"/>
+      <stop offset="1" stop-color="#37B9E9"/>
+    </linearGradient>
+  </defs>
+  <rect width="64" height="64" rx="19" fill="#111820"/>
+  <path d="M13 34h9l4-13 8 25 5-17 3 5h9" fill="none" stroke="url(#p)" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
