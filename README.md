@@ -50,7 +50,7 @@ On first launch the app prompts for your **Ultrahuman email** and **UltraSignal 
 
 ## Credentials
 
-- **UltraSignal Partner Token** — from your UltraSignal Partner account (email: `udupi.sachin.acharya@gmail.com`)
+- **UltraSignal Partner Token** — from your UltraSignal Partner account
 - **Partner Code** — your UltraSignal Partner ID
 - **MiniMax API Key** — for the chat assistant (any OpenAI-compatible model works via the HTTP adapter)
 
