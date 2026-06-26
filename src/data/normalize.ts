@@ -275,7 +275,7 @@ export function normalizeFitbitData(payload: RawFitbitPayload): DashboardData {
   const cardioScore = vo2Max ? numeric(vo2Max.split('-').at(-1)?.trim()) : null
 
   return {
-    source: payload.source === 'google-health' ? 'google-health' : 'fitbit',
+    source: payload.source === 'google-health' ? 'google-health' : payload.source === 'ultrahuman' ? 'ultrahuman' : 'fitbit',
     selectedDate: payload.date,
     generatedAt: payload.generatedAt,
     profile: {

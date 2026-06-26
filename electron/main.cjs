@@ -8,9 +8,10 @@ const path = require('node:path')
 const { fileURLToPath } = require('node:url')
 
 const googleHealth = require('./google-health-service.cjs')
+const ultrahuman = require('./ultrahuman-service.cjs')
 const fitbitLegacy = require('./fitbit-legacy-service.cjs')
 const healthCache = require('./health-cache.cjs')
-const { createCodexService, resolveCodexBinary } = require('./codex-service.cjs')
+const { createMiniMaxService } = require('./minimax-service.cjs')
 
 app.commandLine.appendSwitch('lang', 'en-US')
 
@@ -19,6 +20,7 @@ const DEFAULT_REDIRECT_URI = 'http://127.0.0.1:42813/oauth/callback'
 const PROVIDERS = {
   'google-health': googleHealth,
   'fitbit-legacy': fitbitLegacy,
+  'ultrahuman': ultrahuman,
 }
 
 let mainWindow = null
@@ -222,6 +224,10 @@ async function startOAuthFlow() {
 
 async function validAccessToken(credentials) {
   if (!credentials.token) throw new Error('Account not connected.')
+  if (credentials.config.provider === 'ultrahuman') {
+    // Static API key — no refresh needed
+    return credentials
+  }
   if (Number(credentials.token.expiresAt || 0) > Date.now() + 90_000 && credentials.token.access_token) {
     return credentials
   }
@@ -386,6 +392,17 @@ function registerIpc() {
     if (syncInFlight) throw new Error('Wait for the sync to finish before reconnecting the account.')
     return startOAuthFlow()
   })
+  trustedHandle('fitbit:save-ultrahuman-credentials', (input) => {
+    // input: { apiKey, email, partnerCode }
+    const credentials = getCredentials()
+    saveCredentials({
+      ...credentials,
+      config: { provider: 'ultrahuman' },
+      token: { access_token: input.apiKey, email: input.email, partnerCode: input.partnerCode },
+      lastSyncAt: null,
+    })
+    return publicStatus()
+  })
   trustedHandle('fitbit:disconnect', async () => {
     if (syncInFlight) throw new Error('Wait for the sync to finish before disconnecting the account.')
     const credentials = getCredentials()
@@ -432,7 +449,7 @@ function registerIpc() {
   })
   trustedHandle('assistant:get-status', () => {
     const status = codexService?.getStatus() || {}
-    const available = status.available ?? Boolean(resolveCodexBinary())
+    const available = status.available ?? true  // MiniMax is HTTP-based, always available if configured
     const unauthorized = /unauthorized|not logged|sign in|authentication/i.test(String(status.lastError || ''))
     return {
       available,
@@ -489,14 +506,21 @@ app.whenReady().then(() => {
   const userData = app.getPath('userData')
   credentialFile = path.join(userData, 'credentials.secure.json')
   cacheFile = path.join(userData, 'health-cache.secure.json')
-  codexService = createCodexService({ cwd: userData, clientVersion: app.getVersion() })
+  codexService = (() => {
+    const MiniMaxService = require('./minimax-service.cjs')
+    return new MiniMaxService({
+      cwd: userData,
+      clientVersion: app.getVersion(),
+      apiKey: process.env.MINIMAX_API_KEY || '',
+    })
+  })()
   session.defaultSession.setPermissionRequestHandler((_webContents, _permission, callback) => callback(false))
   if (!developmentUrl()) {
     session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
       callback({
         responseHeaders: {
           ...details.responseHeaders,
-          'Content-Security-Policy': ["default-src 'self'; img-src 'self' data: https:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self' https://health.googleapis.com https://api.fitbit.com"],
+          'Content-Security-Policy': ["default-src 'self'; img-src 'self' data: https:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self' https://health.googleapis.com https://api.fitbit.com https://api.minimax.chat"],
         },
       })
     })

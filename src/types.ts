@@ -1,8 +1,8 @@
 export type PageId = 'today' | 'activity' | 'health' | 'sleep' | 'body' | 'devices'
 
-export type DataSource = 'demo' | 'fitbit' | 'google-health' | 'cache'
+export type DataSource = 'demo' | 'fitbit' | 'google-health' | 'ultrahuman' | 'cache'
 
-export type HealthProvider = 'google-health' | 'fitbit-legacy'
+export type HealthProvider = 'google-health' | 'fitbit-legacy' | 'ultrahuman'
 
 export interface TimePoint {
   time: string
@@ -184,7 +184,7 @@ export interface DashboardData {
 }
 
 export interface RawFitbitPayload {
-  source: 'fitbit' | 'google-health'
+  source: 'fitbit' | 'google-health' | 'ultrahuman'
   date: string
   generatedAt: string
   cacheHit?: boolean
