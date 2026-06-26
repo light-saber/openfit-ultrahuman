@@ -17,13 +17,16 @@ async function waitForApiSlot() {
 
 async function request(path, apiKey, partnerCode) {
   await waitForApiSlot()
-  const response = await fetchWithTimeout(`${API_BASE}${path}`, {
-    headers: {
-      authorization: `Bearer ${apiKey}`,
-      'partner-code': partnerCode,
-      accept: 'application/json',
-    },
-  })
+  // The Ultrahuman Personal API expects the token sent verbatim in the
+  // Authorization header — NOT prefixed with "Bearer". Adding the prefix makes
+  // the API respond 401 "Incorrect Personal API Token Provided", which surfaces
+  // to the user as a bogus "authorization is no longer valid" error.
+  const headers = {
+    authorization: apiKey,
+    accept: 'application/json',
+  }
+  if (partnerCode) headers['partner-code'] = partnerCode
+  const response = await fetchWithTimeout(`${API_BASE}${path}`, { headers })
   if (response.status === 429) {
     await new Promise((resolve) => setTimeout(resolve, 30_000))
     return request(path, apiKey, partnerCode)
@@ -80,52 +83,91 @@ async function syncUltrahumanData(config, selectedDate, onProgress = () => {}) {
     source: 'ultrahuman',
     date: selectedDate,
     generatedAt: new Date().toISOString(),
-    endpoints: translateUltrahuman(endpoints, selectedDate),
+    endpoints: translateUltrahuman(endpoints, selectedDate, email),
     errors,
     rateLimit: { limit: 300, remaining: null, resetSeconds: 60 },
     requestStats: { total: jobs.length, succeeded: Object.keys(endpoints).length, successfulKeys: Object.keys(endpoints) },
   }
 }
 
-function translateUltrahuman(raw, selectedDate) {
-  const metrics = raw.metrics || {}
+// The Ultrahuman Personal API returns every metric as an entry in a single
+// `data.metric_data` array, keyed by `type`. Index it so we can look metrics up
+// by name instead of walking the array repeatedly.
+function indexByType(metricData) {
+  const map = {}
+  for (const item of Array.isArray(metricData) ? metricData : []) {
+    if (item && item.type) map[item.type] = item.object || {}
+  }
+  return map
+}
 
-  const sleepData = metrics.sleep_data || {}
-  const hrvData = metrics.hrv_data || {}
-  const heartRate = metrics.heart_rate || {}
-  const activity = metrics.activity || {}
-  const temperature = metrics.temperature || {}
+function isoFromUnix(seconds) {
+  const value = Number(seconds)
+  return Number.isFinite(value) && value > 0 ? new Date(value * 1000).toISOString() : null
+}
 
-  // Sleep mapping
-  const sleepScore = numeric(sleepData.sleep_score)
-  const totalSleepMinutes = numeric(sleepData.total_sleep)
-  const deepSleepMinutes = numeric(sleepData.deep_sleep_minutes)
-  const remSleepMinutes = numeric(sleepData.rem_sleep_minutes)
-  const lightSleepMinutes = numeric(sleepData.light_sleep_minutes)
-  const awakeMinutes = numeric(sleepData.awake_time_minutes)
-  const sleepStartTime = sleepData.sleep_start_time || null
-  const sleepEndTime = sleepData.sleep_end_time || null
-  const noOfCompleteCycles = numeric(sleepData.no_of_complete_cycles)
+// Ultrahuman timestamps are absolute unix seconds; `day_start_timestamp` marks
+// the user's local midnight, so the offset between the two yields the local
+// clock time ("HH:MM:SS") without needing a timezone database.
+function clockFromOffset(timestamp, dayStart) {
+  const secondsIntoDay = ((Math.round(Number(timestamp) - Number(dayStart)) % 86400) + 86400) % 86400
+  const hours = Math.floor(secondsIntoDay / 3600)
+  const minutes = Math.floor((secondsIntoDay % 3600) / 60)
+  const seconds = secondsIntoDay % 60
+  const pad = (value) => String(value).padStart(2, '0')
+  return `${pad(hours)}:${pad(minutes)}:${pad(seconds)}`
+}
 
-  // Calculate efficiency: sleep_score serves as efficiency percentage
-  const sleepPeriod = totalSleepMinutes !== null && awakeMinutes !== null
-    ? totalSleepMinutes + (awakeMinutes || 0)
-    : null
-  const efficiency = sleepScore !== null
-    ? sleepScore
-    : (sleepPeriod && sleepPeriod > 0 && totalSleepMinutes !== null)
-      ? Math.round(totalSleepMinutes / sleepPeriod * 100)
-      : null
+function intradayDataset(metric) {
+  if (!metric || !Array.isArray(metric.values)) return []
+  const dayStart = Number(metric.day_start_timestamp) || 0
+  return metric.values
+    .filter((point) => point && Number.isFinite(Number(point.value)) && Number.isFinite(Number(point.timestamp)))
+    .map((point) => ({ time: clockFromOffset(point.timestamp, dayStart), value: Number(point.value) }))
+}
+
+function averageOfValues(metric) {
+  const numbers = (metric && Array.isArray(metric.values) ? metric.values : [])
+    .map((point) => Number(point.value))
+    .filter((value) => Number.isFinite(value))
+  if (!numbers.length) return null
+  return Math.round((numbers.reduce((sum, value) => sum + value, 0) / numbers.length) * 10) / 10
+}
+
+function translateUltrahuman(raw, selectedDate, email) {
+  const byType = indexByType(raw?.metrics?.data?.metric_data)
+
+  // Sleep mapping — each summary field is a small object (e.g. {minutes: 377}).
+  const sleepObj = byType.Sleep || {}
+  const sleepScore = numeric(sleepObj.sleep_score?.score)
+  const totalSleepMinutes = numeric(sleepObj.total_sleep?.minutes)
+  const timeInBedMinutes = numeric(sleepObj.time_in_bed?.minutes)
+  const deepSleepMinutes = numeric(sleepObj.deep_sleep?.minutes)
+  const remSleepMinutes = numeric(sleepObj.rem_sleep?.minutes)
+  const lightSleepMinutes = numeric(sleepObj.light_sleep?.minutes)
+  const efficiency = numeric(sleepObj.sleep_efficiency?.percentage)
+  const noOfCompleteCycles = numeric(sleepObj.full_sleep_cycles?.cycles)
+  const sleepStartTime = isoFromUnix(sleepObj.bedtime_start)
+  const sleepEndTime = isoFromUnix(sleepObj.bedtime_end)
+  const awakeStage = (Array.isArray(sleepObj.sleep_stages) ? sleepObj.sleep_stages : [])
+    .find((stage) => stage.type === 'awake')
+  const awakeMinutes = awakeStage
+    ? Math.round(numeric(awakeStage.stage_time) / 60)
+    : (timeInBedMinutes !== null && totalSleepMinutes !== null ? timeInBedMinutes - totalSleepMinutes : null)
+  const timeInBed = timeInBedMinutes ?? (totalSleepMinutes !== null && awakeMinutes !== null
+    ? totalSleepMinutes + awakeMinutes
+    : null)
 
   const selectedSleep = totalSleepMinutes !== null ? {
-    logId: sleepData.id || `sleep-${selectedDate}`,
+    logId: `sleep-${selectedDate}`,
     dateOfSleep: selectedDate,
     isMainSleep: true,
     minutesAsleep: totalSleepMinutes,
     minutesAwake: awakeMinutes,
     minutesToFallAsleep: null,
     minutesAfterWakeUp: null,
-    timeInBed: sleepPeriod,
+    timeInBed,
+    sleepScore,
     efficiency,
     startTime: sleepStartTime,
     endTime: sleepEndTime,
@@ -140,20 +182,21 @@ function translateUltrahuman(raw, selectedDate) {
     },
   } : null
 
-  // HRV mapping
-  const hrvValue = numeric(hrvData.hrv_value)
-  const recoveryIndex = numeric(hrvData.recovery_index)
+  // HRV — prefer the nightly sleep HRV; fall back to the daytime average.
+  const hrvValue = numeric(byType.avg_sleep_hrv?.value) ?? numeric(byType.hrv?.avg)
+  const recoveryIndex = numeric(byType.recovery_index?.value)
 
-  // Heart rate mapping
-  const restingHr = numeric(heartRate.resting_hr)
+  // Heart rate — resting HR comes from the sleep-time average.
+  const restingHr = numeric(byType.night_rhr?.avg) ?? numeric(byType.sleep_rhr?.value)
 
-  // Activity mapping
-  const steps = numeric(activity.total_steps)
-  const caloriesOut = numeric(activity.total_calories_burned)
-  const activeMinutes = numeric(activity.active_minutes)
+  // Activity. The Personal API exposes no calories metric, so leave it null.
+  const steps = numeric(byType.steps?.total)
+  const activeMinutes = numeric(byType.active_minutes?.value)
+  const caloriesOut = null
 
-  // Temperature mapping
-  const skinTempAvg = numeric(temperature.skin_temp_avg_celsius)
+  // Temperature — average the skin-temperature samples for the day.
+  const skinTempAvg = averageOfValues(byType.temp) ?? numeric(byType.temp?.last_reading)
+  const vo2Max = numeric(byType.vo2_max?.value)
 
   return {
     profile: { user: { displayName: email || 'Atleta', avatar640: null, memberSince: null, timezone: null } },
@@ -172,13 +215,13 @@ function translateUltrahuman(raw, selectedDate) {
       },
     },
     activityGoals: { goals: {} },
-    stepsIntraday: { 'activities-steps-intraday': { dataset: [] } },
+    stepsIntraday: { 'activities-steps-intraday': { dataset: intradayDataset(byType.steps) } },
     caloriesIntraday: { 'activities-calories-intraday': { dataset: [] } },
     heartIntraday: {
       'activities-heart': restingHr !== null
         ? [{ dateTime: selectedDate, value: { restingHeartRate: restingHr } }]
         : [],
-      'activities-heart-intraday': { dataset: [] },
+      'activities-heart-intraday': { dataset: intradayDataset(byType.hr) },
     },
     sleep: { sleep: selectedSleep ? [selectedSleep] : [] },
     sleepTrend: { sleep: selectedSleep ? [selectedSleep] : [] },
@@ -198,7 +241,7 @@ function translateUltrahuman(raw, selectedDate) {
       spo2: null,
       skinTemperature: skinTempAvg,
       coreTemperature: null,
-      cardioScore: null,
+      cardioScore: vo2Max,
       sleepEfficiency: efficiency,
       bodyFat: null,
       waterMl: null,
@@ -211,7 +254,7 @@ function translateUltrahuman(raw, selectedDate) {
     waterGoal: { goal: {} },
     food: { summary: { calories: null } },
     breathing: { br: [] },
-    hrv: hrvValue !== null || recoveryIndex !== null ? [{
+    hrv: { hrv: hrvValue !== null || recoveryIndex !== null ? [{
       dateTime: selectedDate,
       value: {
         dailyRmssd: hrvValue,
@@ -219,16 +262,18 @@ function translateUltrahuman(raw, selectedDate) {
         entropy: null,
         nonRemHeartRate: recoveryIndex,
       },
-    }] : [],
+    }] : [] },
     spo2: {},
-    skinTemperature: skinTempAvg !== null ? [{ dateTime: selectedDate, value: {
+    skinTemperature: { tempSkin: skinTempAvg !== null ? [{ dateTime: selectedDate, value: {
       nightlyRelative: null,
       nightlyTemperatureCelsius: skinTempAvg,
       baselineTemperatureCelsius: null,
       relativeNightlyStddev30dCelsius: null,
-    } }] : [],
+    } }] : [] },
     coreTemperature: { tempCore: [] },
-    cardio: { cardioScore: [] },
+    cardio: { cardioScore: vo2Max !== null
+      ? [{ dateTime: selectedDate, value: { vo2Max: String(vo2Max) } }]
+      : [] },
     ecg: { ecgReadings: [] },
     activities: { activities: [] },
     identity: {},

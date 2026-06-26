@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from 'react'
 import {
   AssistantRuntimeProvider,
   AuiIf,
@@ -10,7 +10,10 @@ import {
   type ChatModelAdapter,
   type ThreadMessage,
 } from '@assistant-ui/react'
-import { ArrowDown, ArrowUp, Plus, Sparkles, Square, X } from 'lucide-react'
+import { ArrowDown, ArrowUp, Plus, Settings2, Sparkles, Square, X } from 'lucide-react'
+import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
 import { normalizeFitbitData } from '@/data/normalize'
 import {
   buildHealthAssistantContext,
@@ -31,8 +34,11 @@ const unavailableStatus: HealthAssistantStatus = {
   available: false,
   connected: false,
   authenticated: false,
+  configured: false,
   version: null,
 }
+
+const DEFAULT_MINIMAX_MODEL = 'MiniMax-Text-01'
 
 function messageText(message: ThreadMessage | undefined) {
   if (!message) return ''
@@ -52,9 +58,9 @@ function archiveData(archive: RawHealthArchive | null | undefined) {
 
 function statusLabel(status: HealthAssistantStatus, hasBridge: boolean) {
   if (!hasBridge) return 'Desktop only'
-  if (!status.available) return 'Codex not found'
-  if (!status.authenticated) return 'Sign in to Codex'
-  return status.connected ? 'Codex connected' : 'Codex ready'
+  if (!status.configured) return 'Add MiniMax key'
+  if (!status.authenticated) return 'Check MiniMax key'
+  return status.connected ? 'MiniMax connected' : 'MiniMax ready'
 }
 
 function createQueue() {
@@ -96,6 +102,7 @@ export function HealthAssistant({
   const pageRef = useRef(page)
   const navigateRef = useRef(onNavigate)
   const [status, setStatus] = useState(unavailableStatus)
+  const [configuring, setConfiguring] = useState(false)
 
   useEffect(() => { dataRef.current = data }, [data])
   useEffect(() => { pageRef.current = page }, [page])
@@ -111,7 +118,7 @@ export function HealthAssistant({
     } catch (error) {
       setStatus({
         ...unavailableStatus,
-        error: error instanceof Error ? error.message : 'Codex is unavailable.',
+        error: error instanceof Error ? error.message : 'The health coach is unavailable.',
       })
     }
   }, [])
@@ -177,7 +184,7 @@ export function HealthAssistant({
         const navigation = parseAssistantNavigation(fullText)
         const finalText = stripAssistantNavigation(fullText)
         if (navigation) navigateRef.current(navigation)
-        if (!finalText) throw new Error('Codex completed the turn without a response.')
+        if (!finalText) throw new Error('The health coach finished without a response.')
         if (finalText !== lastVisibleText) {
           yield { content: [{ type: 'text', text: finalText }] }
         }
@@ -191,7 +198,9 @@ export function HealthAssistant({
   }), [refreshStatus])
 
   const runtime = useLocalRuntime(modelAdapter)
-  const ready = Boolean(window.healthAssistant && status.available && status.authenticated)
+  const hasBridge = Boolean(window.healthAssistant)
+  const ready = Boolean(hasBridge && status.available && status.authenticated)
+  const showConfig = hasBridge && (!status.configured || configuring)
 
   return (
     <AssistantRuntimeProvider runtime={runtime}>
@@ -205,10 +214,21 @@ export function HealthAssistant({
         <AssistantHeader
           status={status}
           ready={ready}
+          canConfigure={hasBridge && Boolean(status.configured) && !showConfig}
+          onConfigure={() => setConfiguring(true)}
           onClose={() => onOpenChange(false)}
           onStatusRefresh={refreshStatus}
         />
-        <AssistantThread ready={ready} />
+        {showConfig ? (
+          <AssistantConfig
+            status={status}
+            canCancel={Boolean(status.configured)}
+            onCancel={() => setConfiguring(false)}
+            onSaved={async () => { await refreshStatus(); setConfiguring(false) }}
+          />
+        ) : (
+          <AssistantThread ready={ready} />
+        )}
       </aside>
       {open && <button className="assistant-scrim" aria-label="Close health assistant" onClick={() => onOpenChange(false)} />}
     </AssistantRuntimeProvider>
@@ -218,11 +238,15 @@ export function HealthAssistant({
 function AssistantHeader({
   status,
   ready,
+  canConfigure,
+  onConfigure,
   onClose,
   onStatusRefresh,
 }: {
   status: HealthAssistantStatus
   ready: boolean
+  canConfigure: boolean
+  onConfigure: () => void
   onClose: () => void
   onStatusRefresh: () => Promise<void>
 }) {
@@ -245,6 +269,11 @@ function AssistantHeader({
         </span>
       </div>
       <div className="assistant-header-actions">
+        {canConfigure && (
+          <button type="button" aria-label="MiniMax settings" title="MiniMax settings" onClick={onConfigure}>
+            <Settings2 aria-hidden="true" />
+          </button>
+        )}
         <button type="button" aria-label="New conversation" title="New conversation" onClick={() => void newConversation()}>
           <Plus aria-hidden="true" />
         </button>
@@ -253,6 +282,91 @@ function AssistantHeader({
         </button>
       </div>
     </header>
+  )
+}
+
+function AssistantConfig({
+  status,
+  canCancel,
+  onCancel,
+  onSaved,
+}: {
+  status: HealthAssistantStatus
+  canCancel: boolean
+  onCancel: () => void
+  onSaved: () => Promise<void>
+}) {
+  const [apiKey, setApiKey] = useState('')
+  const [model, setModel] = useState(status.model || DEFAULT_MINIMAX_MODEL)
+  const [apiBase, setApiBase] = useState(status.apiBase ?? '')
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  const submit = async (event: FormEvent) => {
+    event.preventDefault()
+    if (!window.healthAssistant || !apiKey.trim() || saving) return
+    setSaving(true)
+    setError(null)
+    try {
+      await window.healthAssistant.saveConfig({
+        apiKey: apiKey.trim(),
+        model: model.trim() || undefined,
+        apiBase: apiBase.trim() || undefined,
+      })
+      await onSaved()
+    } catch (saveError) {
+      setError(saveError instanceof Error ? saveError.message : 'Could not save the MiniMax key.')
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return (
+    <form className="assistant-config" onSubmit={submit}>
+      <div className="assistant-config-intro">
+        <h2>Connect your health coach</h2>
+        <p>Paste your MiniMax API key to chat with an AI coach grounded in your Ultrahuman data. The key is encrypted on this device and never leaves it except to call MiniMax.</p>
+      </div>
+      <div className="form-field">
+        <Label htmlFor="minimax-key">MiniMax API key</Label>
+        <Input
+          id="minimax-key"
+          type="password"
+          value={apiKey}
+          onChange={(event) => setApiKey(event.target.value)}
+          placeholder={status.configured ? '•••••••• saved — paste to replace' : 'eyJhbGciOi…'}
+          autoComplete="off"
+        />
+      </div>
+      <div className="form-field">
+        <Label htmlFor="minimax-model">Model</Label>
+        <Input
+          id="minimax-model"
+          value={model}
+          onChange={(event) => setModel(event.target.value)}
+          placeholder={DEFAULT_MINIMAX_MODEL}
+          autoComplete="off"
+          spellCheck={false}
+        />
+      </div>
+      <div className="form-field">
+        <Label htmlFor="minimax-base">API base URL · optional</Label>
+        <Input
+          id="minimax-base"
+          value={apiBase}
+          onChange={(event) => setApiBase(event.target.value)}
+          placeholder="https://api.minimax.chat/v1"
+          autoComplete="off"
+          spellCheck={false}
+        />
+        <p>Leave blank for the default. International accounts use https://api.minimaxi.chat/v1.</p>
+      </div>
+      {error && <p className="assistant-config-error" role="alert">{error}</p>}
+      <div className="assistant-config-actions">
+        {canCancel && <Button type="button" variant="outline" onClick={onCancel}>Cancel</Button>}
+        <Button type="submit" disabled={saving || !apiKey.trim()}>{saving ? 'Saving…' : 'Save key'}</Button>
+      </div>
+    </form>
   )
 }
 
@@ -287,7 +401,7 @@ function AssistantThread({ ready }: { ready: boolean }) {
               className="assistant-composer-input"
               rows={1}
               disabled={!ready}
-              placeholder={ready ? 'Ask about your health…' : 'Connect Codex Desktop to chat'}
+              placeholder={ready ? 'Ask about your health…' : 'Add your MiniMax key to chat'}
               aria-label="Message health assistant"
             />
             <AuiIf condition={(state) => !state.thread.isRunning}>

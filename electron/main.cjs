@@ -91,6 +91,56 @@ function saveCredentials(credentials) {
   writeSecure(credentialFile, credentials)
 }
 
+const DEFAULT_LLM_MODEL = 'MiniMax-Text-01'
+
+// Resolve the LLM (MiniMax) config, preferring the in-app encrypted credentials
+// and falling back to environment variables for headless/dev usage.
+function llmConfig() {
+  const llm = getCredentials().llm || {}
+  return {
+    provider: 'minimax',
+    apiKey: String(llm.apiKey || process.env.MINIMAX_API_KEY || '').trim(),
+    model: String(llm.model || process.env.MINIMAX_MODEL || DEFAULT_LLM_MODEL).trim(),
+    apiBase: String(llm.apiBase || process.env.MINIMAX_API_BASE || '').trim(),
+  }
+}
+
+// (Re)create the assistant service from the current LLM config. The service has
+// no setters for the key/model, so we dispose and rebuild whenever it changes.
+function rebuildAssistant() {
+  const previous = codexService
+  const llm = llmConfig()
+  codexService = createMiniMaxService({
+    cwd: app.getPath('userData'),
+    clientVersion: app.getVersion(),
+    apiKey: llm.apiKey,
+    model: llm.model,
+    apiBase: llm.apiBase || undefined,
+  })
+  assistantRequestId = null
+  if (previous) void previous.dispose()
+}
+
+// Public assistant status — never leaks the API key, only whether one is set
+// plus the non-secret model/endpoint for display in the UI.
+function assistantStatus() {
+  const llm = llmConfig()
+  const configured = Boolean(llm.apiKey)
+  const status = codexService?.getStatus() || {}
+  const unauthorized = /unauthorized|not logged|sign in|authentication|api key/i.test(String(status.lastError || ''))
+  return {
+    available: configured,
+    configured,
+    connected: Boolean(status.connected),
+    authenticated: Boolean(configured && !unauthorized),
+    provider: 'minimax',
+    model: llm.model,
+    apiBase: llm.apiBase || null,
+    version: null,
+    ...(status.lastError ? { error: status.lastError } : {}),
+  }
+}
+
 function publicStatus() {
   const credentials = getCredentials()
   const config = credentials.config || {}
@@ -252,15 +302,28 @@ async function syncData(date) {
   let credentials = getCredentials()
   credentials = await validAccessToken(credentials)
   const service = providerFor(credentials)
-  const payload = await service.syncData(credentials.token.access_token, date, (progress) => {
+  // Ultrahuman uses a static API key and needs the email + partner code on every
+  // request, so it expects a config object instead of a bare OAuth access token.
+  const syncArg = service.provider === 'ultrahuman'
+    ? {
+        apiKey: credentials.token.access_token,
+        email: credentials.token.email,
+        partnerCode: credentials.token.partnerCode,
+      }
+    : credentials.token.access_token
+  const payload = await service.syncData(syncArg, date, (progress) => {
     mainWindow?.webContents.send('fitbit:sync-progress', { ...progress, date })
   })
   const total = Number(payload.requestStats?.total || 0)
   const succeeded = Number(payload.requestStats?.succeeded || 0)
   const successfulKeys = Array.isArray(payload.requestStats?.successfulKeys) ? payload.requestStats.successfulKeys : []
-  const minimumUsefulResponses = Math.max(3, Math.ceil(total * 0.2))
+  // Ultrahuman exposes a single `metrics` endpoint per day, so the multi-source
+  // quorum used for Fitbit/Google would always reject an otherwise valid sync.
+  const minimumUsefulResponses = service.provider === 'ultrahuman' ? 1 : Math.max(3, Math.ceil(total * 0.2))
   const measurementKeys = service.provider === 'google-health'
     ? ['stepsDaily', 'caloriesDaily', 'distanceDaily', 'activeMinutesDaily', 'zoneMinutesDaily', 'weightDaily', 'waterDaily', 'nutritionDaily', 'heartIntradayRaw', 'restingHeartRaw', 'hrvRaw', 'spo2Raw', 'breathingRaw', 'skinTemperatureRaw', 'cardioRaw', 'sleepRaw', 'activitiesRaw', 'ecgRaw', 'irnAlertsRaw', 'glucoseRaw']
+    : service.provider === 'ultrahuman'
+    ? ['metrics']
     : ['activity', 'stepsIntraday', 'stepsTrend', 'caloriesTrend', 'heartIntraday', 'heartTrend', 'sleep', 'sleepTrend', 'bodyWeight', 'bodyFat', 'food', 'water', 'breathing', 'hrv', 'spo2', 'skinTemperature', 'coreTemperature', 'cardio', 'ecg', 'irregularRhythmAlerts', 'bloodGlucose', 'activities']
   const hasMeasurementResponse = successfulKeys.some((key) => measurementKeys.includes(key))
   if (!total || succeeded < minimumUsefulResponses || !hasMeasurementResponse) {
@@ -315,12 +378,12 @@ function sendAssistantEvent(event) {
 }
 
 function assistantErrorMessage(error) {
-  const message = error instanceof Error ? error.message : 'Codex is unavailable right now.'
+  const message = error instanceof Error ? error.message : 'The health coach is unavailable right now.'
   return String(message)
     .replace(/[\u0000-\u001f\u007f]/g, ' ')
     .replace(/\s+/g, ' ')
     .trim()
-    .slice(0, 600) || 'Codex is unavailable right now.'
+    .slice(0, 600) || 'The health coach is unavailable right now.'
 }
 
 function validAssistantRequestId(value) {
@@ -455,20 +518,27 @@ function registerIpc() {
     if (url.protocol !== 'https:') throw new Error('Only HTTPS links are allowed.')
     return shell.openExternal(url.toString())
   })
-  trustedHandle('assistant:get-status', () => {
-    const status = codexService?.getStatus() || {}
-    const available = status.available ?? true  // MiniMax is HTTP-based, always available if configured
-    const unauthorized = /unauthorized|not logged|sign in|authentication/i.test(String(status.lastError || ''))
-    return {
-      available,
-      connected: Boolean(status.connected),
-      authenticated: Boolean(available && !unauthorized),
-      version: null,
-      ...(status.lastError ? { error: status.lastError } : {}),
+  trustedHandle('assistant:get-status', () => assistantStatus())
+  trustedHandle('assistant:save-config', (input) => {
+    const apiKey = String(input?.apiKey || '').trim()
+    const model = String(input?.model || '').trim()
+    const apiBase = String(input?.apiBase || '').trim()
+    if (!apiKey) throw new Error('Enter your MiniMax API key.')
+    if (apiBase) {
+      let parsed
+      try { parsed = new URL(apiBase) } catch { throw new Error('The MiniMax API base URL is invalid.') }
+      if (parsed.protocol !== 'https:') throw new Error('The MiniMax API base URL must use HTTPS.')
     }
+    const credentials = getCredentials()
+    saveCredentials({
+      ...credentials,
+      llm: { provider: 'minimax', apiKey, model: model || DEFAULT_LLM_MODEL, apiBase },
+    })
+    rebuildAssistant()
+    return assistantStatus()
   })
   trustedHandle('assistant:start-turn', (input) => {
-    if (!codexService) throw new Error('The Codex bridge is not ready.')
+    if (!codexService) throw new Error('The health coach is not ready.')
     if (!input || !validAssistantRequestId(input.requestId)) throw new Error('Invalid assistant request.')
     const requestId = input.requestId
     if (assistantRequestId && assistantRequestId !== requestId) throw new Error('Wait for the current assistant response to finish.')
@@ -514,14 +584,7 @@ app.whenReady().then(() => {
   const userData = app.getPath('userData')
   credentialFile = path.join(userData, 'credentials.secure.json')
   cacheFile = path.join(userData, 'health-cache.secure.json')
-  codexService = (() => {
-    const MiniMaxService = require('./minimax-service.cjs')
-    return new MiniMaxService({
-      cwd: userData,
-      clientVersion: app.getVersion(),
-      apiKey: process.env.MINIMAX_API_KEY || '',
-    })
-  })()
+  rebuildAssistant()
   session.defaultSession.setPermissionRequestHandler((_webContents, _permission, callback) => callback(false))
   if (!developmentUrl()) {
     session.defaultSession.webRequest.onHeadersReceived((details, callback) => {

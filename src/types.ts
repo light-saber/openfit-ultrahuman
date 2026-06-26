@@ -247,7 +247,17 @@ export interface HealthAssistantStatus {
   connected: boolean
   authenticated: boolean
   version: string | null
+  configured?: boolean
+  provider?: string
+  model?: string
+  apiBase?: string | null
   error?: string
+}
+
+export interface HealthAssistantConfigInput {
+  apiKey: string
+  model?: string
+  apiBase?: string
 }
 
 export type HealthAssistantEvent =
@@ -258,6 +268,7 @@ export type HealthAssistantEvent =
 
 export interface HealthAssistantBridge {
   getStatus: () => Promise<HealthAssistantStatus>
+  saveConfig: (config: HealthAssistantConfigInput) => Promise<HealthAssistantStatus>
   startTurn: (input: {
     requestId: string
     message: string
