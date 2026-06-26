@@ -691,8 +691,7 @@ function SettingsDialog({
   const isUltrahuman = provider === 'ultrahuman'
   const providerLabel = isUltrahuman ? 'Ultrahuman' : provider === 'google-health' ? 'Google Health' : 'Fitbit legacy'
   const savedSecretMatchesProvider = status.hasClientSecret && status.provider === provider
-  const canSave = status.storageEncrypted
-    && clientId.trim().length > 2
+  const canSave = clientId.trim().length > 2
     && (!secretRequired || clientSecret.trim().length > 4 || savedSecretMatchesProvider)
     && (isUltrahuman ? redirectUri.includes('@') : redirectUri.startsWith('http://127.0.0.1:'))
 

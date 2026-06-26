@@ -945,7 +945,7 @@ export function DevicesView({ data, status }: ViewProps) {
   const isDemo = data.source === 'demo'
   const isConnected = status.connected || isDemo
   const sourceName = isDemo ? 'Sample data' : status.provider === 'fitbit-legacy' ? 'Fitbit legacy' : status.provider === 'ultrahuman' ? 'Ultrahuman' : 'Google Health'
-  const deviceName = data.device?.name ?? (isDemo ? 'Google Fitbit Air' : sourceName)
+  const deviceName = data.device?.name ?? (isDemo ? 'Google Fitbit Air' : (status.provider === 'ultrahuman' ? 'Ultrahuman Ring' : sourceName))
 
   return (
     <div className="page-stack devices-page">
